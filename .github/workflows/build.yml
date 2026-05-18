@@ -1,7 +1,6 @@
 name: Build Fladder
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - "v*"
