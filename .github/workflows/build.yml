@@ -117,8 +117,8 @@ jobs:
         shell: bash
 
   build-android:
-    needs: [fetch-info]
     runs-on: ubuntu-latest
+    needs: [fetch-info] 
     outputs:
       artifact_suffix: ${{ env.ARTIFACT_SUFFIX }}
     steps:
@@ -208,7 +208,6 @@ jobs:
   build-windows:
     runs-on: windows-2022
     needs: [fetch-info]
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4.1.1
@@ -288,7 +287,6 @@ jobs:
   build-macos:
     runs-on: macos-latest
     needs: [fetch-info]
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4.1.1
