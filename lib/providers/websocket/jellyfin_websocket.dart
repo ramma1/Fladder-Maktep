@@ -2,12 +2,46 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:developer';
 
-import 'package:fladder/models/syncplay/syncplay_models.dart';
+import 'package:flutter/foundation.dart' show TargetPlatform;
 import 'package:web_socket_channel/web_socket_channel.dart';
 
-/// Manages WebSocket connection to Jellyfin server for SyncPlay
-class WebSocketManager {
-  WebSocketManager({
+/// WebSocket connection state.
+///
+/// Moved here from `lib/models/syncplay/syncplay_models.dart` so the
+/// socket layer no longer depends on SyncPlay models.
+enum WebSocketConnectionState {
+  disconnected,
+  connecting,
+  connected,
+  reconnecting,
+}
+
+/// Pure platform classification for the lifecycle gate.
+///
+/// A "phone" (Android/iOS handheld, not Android-TV/leanback) is the only
+/// platform that gets the background/resume disconnect-reconnect cycle.
+/// Desktop, Web, and Android-TV/leanback stay always-alive.
+///
+/// Kept as a free function with no Flutter-binding dependency so it is
+/// unit-testable without `TestWidgetsFlutterBinding`.
+bool isPhonePlatform({
+  required bool isWeb,
+  required TargetPlatform platform,
+  required bool leanBackMode,
+}) {
+  if (isWeb) {
+    return false;
+  }
+  final isAndroidOrIos = platform == TargetPlatform.android || platform == TargetPlatform.iOS;
+  return isAndroidOrIos && !leanBackMode;
+}
+
+/// Manages a single WebSocket connection to the Jellyfin server.
+///
+/// App-level shared connection (formerly `WebSocketManager`, owned by
+/// SyncPlay). Connection / keep-alive / reconnect logic is unchanged.
+class JellyfinWebSocket {
+  JellyfinWebSocket({
     required this.serverUrl,
     required this.token,
     required this.deviceId,
@@ -37,11 +71,12 @@ class WebSocketManager {
   Uri get _webSocketUri {
     final baseUri = Uri.parse(serverUrl);
     final scheme = baseUri.scheme == 'https' ? 'wss' : 'ws';
+    final basePath = baseUri.path.replaceAll(RegExp(r'/+$'), '');
     return Uri(
       scheme: scheme,
       host: baseUri.host,
       port: baseUri.port,
-      path: '${baseUri.path}/socket',
+      path: '$basePath/socket',
       queryParameters: {
         'api_key': token,
         'deviceId': deviceId,

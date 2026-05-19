@@ -10,11 +10,11 @@ import 'package:fladder/providers/router_provider.dart';
 import 'package:fladder/providers/syncplay/handlers/syncplay_command_handler.dart';
 import 'package:fladder/providers/syncplay/handlers/syncplay_message_handler.dart';
 import 'package:fladder/providers/syncplay/time_sync_service.dart';
-import 'package:fladder/providers/syncplay/websocket_manager.dart';
+import 'package:fladder/providers/websocket/jellyfin_websocket.dart';
+import 'package:fladder/providers/websocket/jellyfin_websocket_provider.dart';
 import 'package:fladder/providers/user_provider.dart';
 import 'package:fladder/providers/video_player_provider.dart';
 import 'package:fladder/screens/shared/fladder_notification_overlay.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:fladder/l10n/generated/app_localizations.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -67,7 +67,6 @@ class SyncPlayController {
 
   final Ref _ref;
 
-  WebSocketManager? _wsManager;
   TimeSyncService? _timeSync;
   StreamSubscription? _wsMessageSubscription;
   StreamSubscription? _wsStateSubscription;
@@ -85,7 +84,6 @@ class SyncPlayController {
 
   // Lifecycle state for reconnection
   String? _lastGroupId;
-  bool _wasConnected = false;
 
   // Previous WebSocket state — used to detect reconnect transitions in
   // `_handleConnectionState` so we can silently rejoin the last group.
@@ -410,7 +408,11 @@ class SyncPlayController {
 
   JellyfinOpenApi get _api => _ref.read(jellyApiProvider).api;
 
-  /// Initialize and connect to SyncPlay
+  /// Subscribe SyncPlay to the shared app-level WebSocket.
+  ///
+  /// The socket itself is owned by [JellyfinWebSocketController] and is
+  /// connected/disconnected off `userProvider`; SyncPlay only attaches
+  /// its message/state listeners and starts time-sync.
   Future<void> connect() async {
     final user = _ref.read(userProvider);
     if (user == null) {
@@ -418,31 +420,34 @@ class SyncPlayController {
       return;
     }
 
-    final serverUrl = _ref.read(serverUrlProvider);
-    if (serverUrl == null || serverUrl.isEmpty) {
-      log('SyncPlay: Cannot connect without server URL');
+    // Activate the shared socket provider and grab its notifier.
+    final ws = _ref.read(jellyfinWebSocketControllerProvider.notifier);
+
+    // Idempotent: if we are already subscribed, do nothing. (This path
+    // is hit every time the SyncPlay sheet re-opens via loadGroups().)
+    if (_wsStateSubscription != null) {
+      log('SyncPlay: connect() called but already subscribed; reusing shared socket');
       return;
     }
 
-    // Initialize time sync
+    // Initialize time sync (SyncPlay-owned, not part of the socket).
     _timeSync = TimeSyncService(_api);
     _timeSync!.start();
 
-    // Initialize WebSocket
-    log('SyncPlay: Initializing WebSocket with deviceId: ${user.credentials.deviceId}');
-    _wsManager = WebSocketManager(
-      serverUrl: serverUrl,
-      token: user.credentials.token,
-      deviceId: user.credentials.deviceId,
-    );
+    _wsStateSubscription = ws.connectionState.listen(_handleConnectionState);
+    _wsMessageSubscription = ws.messages.listen(_handleMessage);
 
-    _wsStateSubscription = _wsManager!.connectionState.listen(_handleConnectionState);
-    _wsMessageSubscription = _wsManager!.messages.listen(_handleMessage);
-
-    await _wsManager!.connect();
+    // The shared socket is app-owned and is usually already connected by
+    // the time the user opens SyncPlay. The re-broadcast stream does not
+    // replay, so seed from the current state — otherwise `isConnected`
+    // would stay false and `joinGroup` would be blocked.
+    _handleConnectionState(ws.currentState);
   }
 
-  /// Disconnect from SyncPlay
+  /// Detach SyncPlay from the shared WebSocket.
+  ///
+  /// Does NOT close the socket — it is app-owned and shared. Leaving a
+  /// SyncPlay group no longer tears down the connection.
   Future<void> disconnect() async {
     resetCorrectionState(
       reason: 'disconnect',
@@ -451,11 +456,11 @@ class SyncPlayController {
     await leaveGroup();
     _resetGroupLifecycleState();
     _commandHandler.cancelPendingCommands();
-    _wsMessageSubscription?.cancel();
-    _wsStateSubscription?.cancel();
+    await _wsMessageSubscription?.cancel();
+    await _wsStateSubscription?.cancel();
+    _wsMessageSubscription = null;
+    _wsStateSubscription = null;
     _timeSync?.dispose();
-    await _wsManager?.dispose();
-    _wsManager = null;
     _timeSync = null;
     _updateState(SyncPlayState());
   }
@@ -501,17 +506,10 @@ class SyncPlayController {
 
     log('SyncPlay: Joining group: $groupId');
     final confirmed = await _sendJoinRequest(groupId);
-    if (confirmed) {
-      log('SyncPlay: Group join confirmed');
-      // Only stamp `_lastGroupId` after confirmation. If we set it
-      // before, a WS reconnect during the awaited join window would
-      // trip `_handleConnectionState`'s silent-rejoin path, which
-      // would create a second join completer mid-flight and race the
-      // original.
-      _lastGroupId = groupId;
-    } else {
-      log('SyncPlay: Group join not confirmed');
-    }
+    // `_lastGroupId` is stamped in `_onGroupJoined` from the server
+    // frame (source of truth), so it is correct even if a slow socket
+    // makes this call reconcile/return before `GroupJoined` lands.
+    log(confirmed ? 'SyncPlay: Group join confirmed' : 'SyncPlay: Group join not confirmed');
     return confirmed;
   }
 
@@ -520,25 +518,52 @@ class SyncPlayController {
   /// state management (e.g. `leaveGroup` first, `_lastGroupId` updates).
   /// Used by both [joinGroup] and [_attemptSilentRejoin].
   Future<bool> _sendJoinRequest(String groupId) async {
+    final completer = _joinGroupCompleter = Completer<bool>();
     try {
-      _joinGroupCompleter = Completer<bool>();
       await _api.syncPlayJoinPost(
         body: JoinGroupRequestDto(groupId: groupId),
       );
-      final confirmed = await _joinGroupCompleter!.future.timeout(
-        const Duration(seconds: 5),
+      final confirmed = await completer.future.timeout(
+        const Duration(seconds: 12),
         onTimeout: () {
-          log('SyncPlay: Timeout waiting for GroupJoined confirmation');
-          return false;
+          // The POST itself succeeded (no exception). Jellyfin keys
+          // SyncPlay membership by session and `Join` is idempotent, so
+          // a missing `GroupJoined` inside the window is almost always a
+          // slow/stalled WebSocket — not a real rejection. Genuine
+          // rejections arrive promptly as NotInGroup/GroupDoesNotExist
+          // and complete the completer `false` long before this fires.
+          // `_handleGroupJoined` also flips `isInGroup` whenever the
+          // frame eventually lands (or after a silent rejoin), so
+          // reconcile against the authoritative state instead of
+          // reporting a false "Failed to join group".
+          final joined = _state.isInGroup && _state.groupId == groupId;
+          log('SyncPlay: GroupJoined not received within timeout; '
+              'reconciled isInGroup=$joined for $groupId');
+          return joined;
         },
       );
-      _joinGroupCompleter = null;
+      if (identical(_joinGroupCompleter, completer)) {
+        _joinGroupCompleter = null;
+      }
       return confirmed;
     } catch (e) {
       log('SyncPlay: Failed to send join request: $e');
-      _joinGroupCompleter?.complete(false);
-      _joinGroupCompleter = null;
+      if (identical(_joinGroupCompleter, completer)) {
+        _completeJoinRequest(false);
+      }
       return false;
+    }
+  }
+
+  /// Complete and clear the pending join completer exactly once. Safe to
+  /// call from the success path, the failure path, the leave/kick reset
+  /// path, and a late-arriving `GroupJoined` — without ever risking a
+  /// "Future already completed" or leaking a stale completer reference.
+  void _completeJoinRequest(bool joined) {
+    final completer = _joinGroupCompleter;
+    _joinGroupCompleter = null;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete(joined);
     }
   }
 
@@ -553,7 +578,15 @@ class SyncPlayController {
       reason: 'group_joined',
       syncEnabled: true,
     );
-    _joinGroupCompleter?.complete(true);
+    // Stamp `_lastGroupId` from the authoritative server frame, not the
+    // awaited `joinGroup` bool. A slow socket can make `_sendJoinRequest`
+    // time out (reconciled false) and only deliver `GroupJoined` after
+    // `joinGroup` already returned — without this, the reconnect
+    // silent-rejoin invariant (`_handleConnectionState`) would be lost
+    // even though we are genuinely in the group. This only fires on a
+    // real `GroupJoined`, so it is still "only on confirmation".
+    _lastGroupId = _state.groupId ?? _lastGroupId;
+    _completeJoinRequest(true);
     final showSnackbar = _state.groupName != null;
     if (showSnackbar) {
       _showGroupSnackbar(
@@ -591,7 +624,7 @@ class SyncPlayController {
 
   /// Called by message handler when NotInGroup/GroupDoesNotExist is received
   void _onGroupJoinFailed() {
-    _joinGroupCompleter?.complete(false);
+    _completeJoinRequest(false);
   }
 
   /// Called when we leave or are kicked; cancel pending commands,
@@ -663,10 +696,7 @@ class SyncPlayController {
       _startPlaybackCompleter!.complete(false);
     }
     _startPlaybackCompleter = null;
-    if (_joinGroupCompleter != null && !_joinGroupCompleter!.isCompleted) {
-      _joinGroupCompleter!.complete(false);
-    }
-    _joinGroupCompleter = null;
+    _completeJoinRequest(false);
   }
 
   /// When server reports Playing, ensure player is actually playing (per docs: recover if Unpause command was missed).
@@ -1041,14 +1071,25 @@ class SyncPlayController {
     final isReconnect = isConnected && !wasConnected;
     _previousWsState = wsState;
 
-    if (isReconnect && _lastGroupId != null) {
-      // ColorOS / aggressive Android battery savers can drop the
-      // WebSocket during a brief window-focus loss — without a
-      // corresponding `AppLifecycleState.paused` — so the lifecycle
-      // observer can't catch it. Auto-rejoin here covers that case
-      // and runs even when the app stayed in the foreground.
-      log('SyncPlay: WS reconnected, attempting silent rejoin of $_lastGroupId');
-      unawaited(_attemptSilentRejoin());
+    if (isReconnect) {
+      // A fresh socket connection (initial or reconnect) may have a
+      // stale clock offset. Refresh time-sync on every reconnect — a
+      // safe superset of the old resume-only refresh that used to live
+      // in the now-deleted _handleAppResume().
+      if (_timeSync != null) {
+        _timeSync!.start();
+        unawaited(_timeSync!.forceUpdate());
+      }
+
+      if (_lastGroupId != null) {
+        // ColorOS / aggressive Android battery savers can drop the
+        // WebSocket during a brief window-focus loss — without a
+        // corresponding `AppLifecycleState.paused` — so the lifecycle
+        // observer can't catch it. Auto-rejoin here covers that case
+        // and runs even when the app stayed in the foreground.
+        log('SyncPlay: WS reconnected, attempting silent rejoin of $_lastGroupId');
+        unawaited(_attemptSilentRejoin());
+      }
     }
   }
 
@@ -1273,73 +1314,6 @@ class SyncPlayController {
   void _updateStateWith(SyncPlayState Function(SyncPlayState) updater) {
     _state = updater(_state);
     _stateController.add(_state);
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Lifecycle Handling (for mobile background/resume)
-  // ─────────────────────────────────────────────────────────────────────────
-
-  /// Handle app lifecycle state changes
-  /// Call this from a WidgetsBindingObserver when app state changes
-  Future<void> handleAppLifecycleChange(AppLifecycleState lifecycleState) async {
-    // On web, we want to stay connected even in background and avoid forced reconnection on resume.
-    if (kIsWeb) {
-      return;
-    }
-
-    switch (lifecycleState) {
-      case AppLifecycleState.paused:
-      case AppLifecycleState.inactive:
-        // App going to background - remember state for reconnection
-        _wasConnected = _wsManager?.currentState == WebSocketConnectionState.connected;
-        log('SyncPlay: App paused, wasConnected=$_wasConnected, lastGroupId=$_lastGroupId');
-        break;
-
-      case AppLifecycleState.resumed:
-        // App returning to foreground - attempt reconnection if needed
-        log('SyncPlay: App resumed, wasConnected=$_wasConnected, isInGroup=${_state.isInGroup}');
-        if (_wasConnected || _state.isInGroup) {
-          await _handleAppResume();
-        }
-        break;
-
-      case AppLifecycleState.detached:
-      case AppLifecycleState.hidden:
-        // No action needed
-        break;
-    }
-  }
-
-  /// Handle app resume - reconnect WebSocket and optionally rejoin group
-  Future<void> _handleAppResume() async {
-    // Force reconnect WebSocket
-    if (_wsManager != null) {
-      log('SyncPlay: Force reconnecting WebSocket on resume');
-      await _wsManager!.forceReconnect();
-
-      // Wait for connection to establish
-      await Future.delayed(const Duration(milliseconds: 500));
-
-      // Restart time sync if it was active
-      if (_timeSync != null) {
-        _timeSync!.start();
-        await _timeSync!.forceUpdate();
-      }
-
-      // If we were in a group but got disconnected, try to rejoin
-      if (_lastGroupId != null && !_state.isInGroup) {
-        resetCorrectionState(
-          reason: 'pre_rejoin',
-          syncEnabled: false,
-        );
-        log('SyncPlay: Attempting to rejoin group $_lastGroupId');
-        final success = await joinGroup(_lastGroupId!);
-        if (!success) {
-          log('SyncPlay: Failed to rejoin group, clearing lastGroupId');
-          _lastGroupId = null;
-        }
-      }
-    }
   }
 
   /// Display a SyncPlay-related snackbar through the global overlay.
