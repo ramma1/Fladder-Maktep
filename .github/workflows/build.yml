@@ -309,7 +309,9 @@ jobs:
       - name: Ensure correct app name casing
         run: |
           APP_DIR="build/macos/Build/Products/Release-production"
-          mv "$APP_DIR/fladder.app" "$APP_DIR/Fladder.app"
+          if [ -f "$APP_DIR/fladder.app" ]; then
+            mv "$APP_DIR/fladder.app" "$APP_DIR/Fladder.app"
+          fi
 
       - name: Install create-dmg
         run: brew install create-dmg
